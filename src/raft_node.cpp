@@ -138,24 +138,35 @@ void RaftNode::startElection() {
         log("starting election for term " + std::to_string(term));
     }
 
-    int votes = 1;  // vote for self
-    for (const auto& peer : peers_) {
-        auto resp = sendRequestVote(peer.host, peer.port,
-                                     RequestVoteRequest{term, id_},
-                                     kRpcTimeoutMs);
-        std::lock_guard<std::mutex> lock(mu_);
-        if (currentTerm_ != term || role_ != Role::Candidate) return;
-        if (resp.has_value()) {
-            if (resp->term > currentTerm_) {
-                becomeFollower(resp->term);
-                return;
-            }
-            if (resp->voteGranted) votes++;
+    // Fan out RequestVote RPCs to all peers concurrently (one thread each)
+    // instead of sequentially, so a single slow/unreachable peer can't
+    // delay hearing back from the rest by up to kRpcTimeoutMs.
+    std::vector<std::optional<RequestVoteResponse>> responses(peers_.size());
+    {
+        std::vector<std::thread> workers;
+        workers.reserve(peers_.size());
+        for (size_t i = 0; i < peers_.size(); ++i) {
+            const auto& peer = peers_[i];
+            workers.emplace_back([&, i]() {
+                responses[i] = sendRequestVote(
+                    peer.host, peer.port, RequestVoteRequest{term, id_},
+                    kRpcTimeoutMs);
+            });
         }
+        for (auto& t : workers) t.join();
     }
 
+    int votes = 1;  // vote for self
     std::lock_guard<std::mutex> lock(mu_);
     if (currentTerm_ != term || role_ != Role::Candidate) return;
+    for (const auto& resp : responses) {
+        if (!resp.has_value()) continue;
+        if (resp->term > currentTerm_) {
+            becomeFollower(resp->term);
+            return;
+        }
+        if (resp->voteGranted) votes++;
+    }
 
     int majority = static_cast<int>(peers_.size() + 1) / 2 + 1;
     if (votes >= majority) {
@@ -178,10 +189,25 @@ void RaftNode::leaderHeartbeatLoop() {
             if (role_ != Role::Leader) return;
             term = currentTerm_;
         }
-        for (const auto& peer : peers_) {
-            auto resp = sendAppendEntries(peer.host, peer.port,
-                                           AppendEntriesRequest{term, id_},
-                                           kRpcTimeoutMs);
+        // Fan out heartbeats to all peers concurrently so one
+        // slow/unreachable follower can't delay heartbeats to the rest,
+        // which could otherwise cause them to spuriously start elections.
+        std::vector<std::optional<AppendEntriesResponse>> responses(
+            peers_.size());
+        {
+            std::vector<std::thread> workers;
+            workers.reserve(peers_.size());
+            for (size_t i = 0; i < peers_.size(); ++i) {
+                const auto& peer = peers_[i];
+                workers.emplace_back([&, i]() {
+                    responses[i] = sendAppendEntries(
+                        peer.host, peer.port, AppendEntriesRequest{term, id_},
+                        kRpcTimeoutMs);
+                });
+            }
+            for (auto& t : workers) t.join();
+        }
+        for (const auto& resp : responses) {
             if (resp.has_value() && resp->term > term) {
                 std::lock_guard<std::mutex> lock(mu_);
                 becomeFollower(resp->term);
