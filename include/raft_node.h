@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -26,7 +28,12 @@ enum class Role { Follower, Candidate, Leader };
 
 class RaftNode {
 public:
-    RaftNode(uint32_t id, int port, std::vector<PeerInfo> peers);
+    // Called once per committed entry, in order, with the entry's log index
+    // (1-based) and command. Invoked without mu_ held.
+    using ApplyCallback = std::function<void(uint32_t index, const std::string& command)>;
+
+    RaftNode(uint32_t id, int port, std::vector<PeerInfo> peers,
+             ApplyCallback onApply = nullptr);
     ~RaftNode();
 
     // Starts the RPC server and election timer in the background and
@@ -40,16 +47,24 @@ public:
     Role role() const;
     uint32_t term() const;
     uint32_t id() const { return id_; }
+    uint32_t commitIndex() const;
+    // Snapshot of the current log (1-based index == vector index + 1).
+    std::vector<LogEntry> logCopy() const;
 
     // Exposed for unit testing of the pure decision logic without going
     // through the network.
     RequestVoteResponse handleRequestVote(const RequestVoteRequest& req);
     AppendEntriesResponse handleAppendEntries(const AppendEntriesRequest& req);
+    // Only meaningful on the leader; appends `command` to the log at the
+    // current term. Returns {false, leaderId} if this node isn't the
+    // leader (leaderId is 0 if unknown).
+    ClientResponseMsg handleClientRequest(const ClientRequestMsg& req);
 
 private:
     const uint32_t id_;
     const int port_;
     const std::vector<PeerInfo> peers_;
+    const ApplyCallback onApply_;
 
     mutable std::mutex mu_;
     std::condition_variable cv_;
@@ -64,6 +79,17 @@ private:
     // the Raft paper intends.
     int electionTimeoutMs_ = 0;
 
+    // Replicated log; log_[i] is the entry at 1-based index i+1. There is
+    // an implicit "index 0" entry with term 0 that is never stored.
+    std::vector<LogEntry> log_;
+    uint32_t commitIndex_ = 0;
+    uint32_t lastApplied_ = 0;
+    std::optional<uint32_t> leaderId_;  // last known leader, for redirects
+
+    // Leader-only volatile state, reinitialized on becoming leader.
+    std::map<uint32_t, uint32_t> nextIndex_;   // peer id -> next log index to send
+    std::map<uint32_t, uint32_t> matchIndex_;  // peer id -> highest replicated index
+
     std::unique_ptr<RpcServer> server_;
     std::thread electionThread_;
     std::thread heartbeatThread_;
@@ -74,6 +100,13 @@ private:
     void becomeLeader();
     void becomeFollower(uint32_t newTerm);
     void leaderHeartbeatLoop();
+
+    // Log helpers. Caller must hold mu_.
+    uint32_t lastLogIndex() const;   // 0 if log is empty
+    uint32_t lastLogTerm() const;    // 0 if log is empty
+    uint32_t termAt(uint32_t index) const;  // 0 for index 0
+    void advanceCommitIndex();  // leader-only; caller must hold mu_
+    void applyCommitted();      // caller must hold mu_; invokes onApply_ unlocked
 
     int randomElectionTimeoutMs() const;
     void resetElectionDeadline();  // caller must hold mu_
