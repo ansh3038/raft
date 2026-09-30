@@ -62,7 +62,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    raft::RaftNode node(myId, myPort, std::move(peers));
+    raft::RaftNode node(myId, myPort, std::move(peers),
+                         [](uint32_t index, const std::string& command) {
+                             std::cout << "[applied] index=" << index
+                                       << " command=\"" << command << "\""
+                                       << std::endl;
+                         });
     node.run();
     return 0;
 }

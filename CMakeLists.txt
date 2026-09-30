@@ -20,6 +20,9 @@ target_link_libraries(raft_core PUBLIC Threads::Threads)
 add_executable(raft_node src/main.cpp)
 target_link_libraries(raft_node PRIVATE raft_core)
 
+add_executable(raft_client src/raft_client.cpp)
+target_link_libraries(raft_client PRIVATE raft_core)
+
 # --- Tests -------------------------------------------------------------
 enable_testing()
 
