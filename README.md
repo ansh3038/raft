@@ -1,27 +1,44 @@
-# Raft Leader Election (C++)
+# Raft Leader Election + Log Replication (C++)
 
-A minimal, from-scratch implementation of the **leader election** portion of
-the [Raft consensus algorithm](https://raft.github.io/raft.pdf)
+A minimal, from-scratch implementation of **leader election and log
+replication** from the [Raft consensus algorithm](https://raft.github.io/raft.pdf)
 (Ongaro & Ousterhout, "In Search of an Understandable Consensus Algorithm").
 
-Log replication, snapshots, and membership changes are **out of scope** for
-this project — it focuses purely on `RequestVote` / heartbeat `AppendEntries`
-and the Follower → Candidate → Leader state machine.
+Snapshots and cluster membership changes are **out of scope** for this
+project. It covers `RequestVote`, `AppendEntries` (heartbeats + log
+replication), client command submission, and the
+Follower → Candidate → Leader state machine.
 
 Nodes communicate over a **custom, minimal binary RPC protocol** built
 directly on raw TCP sockets (no gRPC/HTTP/serialization libraries).
 
 ## How it works
 
+**Leader election:**
 - Each node is a separate OS process listening on its own TCP port.
 - Time is divided into **terms**. Every node starts as a **Follower**.
 - If a follower doesn't hear a heartbeat within a randomized election
   timeout (1.5–3s), it becomes a **Candidate**, increments its term, votes
   for itself, and sends `RequestVote` RPCs to all peers.
 - A candidate that receives votes from a majority becomes **Leader** and
-  starts sending periodic heartbeat `AppendEntries` RPCs (every 500ms) to
-  maintain authority and reset followers' election timers.
+  starts sending periodic `AppendEntries` RPCs (every 500ms) to maintain
+  authority and reset followers' election timers.
 - Any node that sees a higher term in an RPC steps down to Follower.
+
+**Log replication:**
+- A client submits a command to any node via `ClientRequest`. Only the
+  leader accepts it; other nodes reject with a `leaderId` hint so the
+  client can retry against the actual leader.
+- The leader appends the command to its own log, then replicates it to
+  followers via `AppendEntries`, which also carries `prevLogIndex`/
+  `prevLogTerm` for the **log matching property** consistency check.
+- If a follower's log conflicts with the leader's at some index, it
+  truncates the conflicting suffix and adopts the leader's entries.
+- The leader tracks `nextIndex`/`matchIndex` per peer, decrementing
+  `nextIndex` and retrying on a failed consistency check.
+- Once an entry is replicated to a majority (and is from the leader's
+  current term), the leader advances `commitIndex` and applies the entry;
+  `leaderCommit` propagates this to followers, which apply it locally too.
 
 ## Project layout
 
@@ -29,8 +46,9 @@ directly on raw TCP sockets (no gRPC/HTTP/serialization libraries).
 include/raft_rpc.h    RPC message types, server, client (declarations)
 src/raft_rpc.cpp       TCP socket-based RPC implementation
 include/raft_node.h    RaftNode state machine (declarations)
-src/raft_node.cpp      Election timer, voting, heartbeat logic
+src/raft_node.cpp      Election timer, voting, log replication, commit/apply logic
 src/main.cpp           CLI entry point: reads cluster config, runs a node
+src/raft_client.cpp    CLI to submit a command to the cluster (follows leader redirects)
 tests/                 Unit + integration tests (see below)
 cluster.conf           Sample 5-node local cluster config
 run_cluster.sh         Launches all nodes from cluster.conf as background processes
@@ -40,14 +58,19 @@ run_cluster.sh         Launches all nodes from cluster.conf as background proces
 
 Each RPC is a single short-lived TCP connection. The client connects,
 writes a request, reads a response, and closes the connection. All
-multi-byte integers are sent in network byte order.
+multi-byte integers are sent in network byte order; strings and entry
+lists are framed as `[uint32 length][bytes]`.
 
-| Message                 | Bytes                                      |
-|--------------------------|---------------------------------------------|
-| `RequestVoteRequest`     | `type(1) + term(4) + candidateId(4)`        |
-| `RequestVoteResponse`    | `type(1) + term(4) + voteGranted(1)`        |
-| `AppendEntriesRequest`   | `type(1) + term(4) + leaderId(4)`           |
-| `AppendEntriesResponse`  | `type(1) + term(4) + success(1)`            |
+| Message                 | Bytes                                                                  |
+|--------------------------|-------------------------------------------------------------------------|
+| `RequestVoteRequest`     | `type(1) + term(4) + candidateId(4)`                                    |
+| `RequestVoteResponse`    | `type(1) + term(4) + voteGranted(1)`                                    |
+| `AppendEntriesRequest`   | `type(1) + term(4) + leaderId(4) + prevLogIndex(4) + prevLogTerm(4) + leaderCommit(4) + entries` |
+| `AppendEntriesResponse`  | `type(1) + term(4) + success(1) + matchIndex(4)`                        |
+| `ClientRequest`          | `type(1) + command(string)`                                             |
+| `ClientResponse`         | `type(1) + success(1) + leaderId(4)`                                    |
+
+Each `LogEntry` (used in `entries` above) is `term(4) + command(string)`.
 
 ## Building
 
@@ -61,6 +84,7 @@ cmake --build build
 
 This produces:
 - `build/raft_node` — the node binary
+- `build/raft_client` — CLI to submit a command to the cluster
 - `build/test_rpc`, `build/test_raft_node`, `build/test_election` — test binaries
 
 ## Running a local cluster
@@ -88,6 +112,22 @@ To test failover, kill the current leader's process (its id/pid is printed
 by `run_cluster.sh`) and watch the remaining nodes elect a new leader in the
 logs.
 
+## Submitting client commands
+
+Once a cluster is running, submit a command with `raft_client`:
+
+```bash
+./build/raft_client cluster.conf set x=42
+```
+
+The client tries nodes from `cluster.conf` in order; a non-leader node
+replies with the current leader's id, and the client automatically
+retries against it. Applied commands are logged by each node as:
+
+```
+[applied] index=1 command="set x=42"
+```
+
 ## Running the tests
 
 Tests use [CTest](https://cmake.org/cmake/help/latest/manual/ctest.1.html)
@@ -107,14 +147,16 @@ Test suites:
   heartbeat-handling decision logic, called directly without starting a
   server or touching the network.
 - **`test_election`** — integration test that spins up a real 3-node
-  cluster in-process (real TCP loopback) and asserts exactly one leader is
-  elected and the other two converge to Follower in the same term.
+  cluster in-process (real TCP loopback), asserts exactly one leader is
+  elected and the other two converge to Follower in the same term, then
+  submits client commands to the leader and verifies every node
+  replicates and applies them at matching log indices.
 
 ## Known limitations
 
-- No persistent storage: `currentTerm`/`votedFor` are in memory only, so a
-  restarted node forgets its term (fine for a leader-election demo, not
-  safe for production use).
-- No log replication, snapshotting, or cluster membership changes.
+- No persistent storage: `currentTerm`/`votedFor`/the log are in memory
+  only, so a restarted node loses all state (fine for a demo, not safe for
+  production use).
+- No snapshotting or cluster membership changes.
 - RPC has no authentication/encryption — intended for local/trusted
   networks only.
