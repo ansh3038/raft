@@ -40,6 +40,21 @@ directly on raw TCP sockets (no gRPC/HTTP/serialization libraries).
   current term), the leader advances `commitIndex` and applies the entry;
   `leaderCommit` propagates this to followers, which apply it locally too.
 
+**Persistence (write-ahead log + periodic snapshot):**
+- Each node writes `currentTerm`/`votedFor` (`meta.dat`) and every log
+  entry (append-only `log.dat`) to its own data directory, and reloads
+  them on startup — this is what lets a restarted node avoid violating
+  Raft's safety rules (e.g. voting twice in a term it already voted in,
+  or forgetting a log entry it had acknowledged).
+- Per the paper (§5.1, Figure 2), these writes happen **before**
+  responding to the RPC that caused them: a vote grant persists
+  `votedFor` first, an `AppendEntries` append persists each new entry
+  first, and a term bump persists `currentTerm` first.
+- Once `lastApplied` has advanced by `snapshotThreshold` entries past the
+  last snapshot, the node writes a snapshot boundary (`snapshot.dat`) and
+  compacts `log.dat`/the in-memory log down to just the entries after it,
+  bounding on-disk and in-memory log growth.
+
 ## Project layout
 
 ```
@@ -47,6 +62,8 @@ include/raft_rpc.h    RPC message types, server, client (declarations)
 src/raft_rpc.cpp       TCP socket-based RPC implementation
 include/raft_node.h    RaftNode state machine (declarations)
 src/raft_node.cpp      Election timer, voting, log replication, commit/apply logic
+include/raft_storage.h WAL + metadata + snapshot persistence (declarations)
+src/raft_storage.cpp   File-based WAL/metadata/snapshot implementation
 src/main.cpp           CLI entry point: reads cluster config, runs a node
 src/raft_client.cpp    CLI to submit a command to the cluster (follows leader redirects)
 tests/                 Unit + integration tests (see below)
@@ -151,12 +168,16 @@ Test suites:
   elected and the other two converge to Follower in the same term, then
   submits client commands to the leader and verifies every node
   replicates and applies them at matching log indices.
+- **`test_persistence`** — destroys and recreates `RaftNode`s against the
+  same data directory (simulating a crash/restart) and checks that
+  `currentTerm`/`votedFor`/the log survive, that a conflicting-suffix
+  truncation is reflected on disk, and that snapshotting compacts the log
+  once the threshold is crossed.
 
 ## Known limitations
 
-- No persistent storage: `currentTerm`/`votedFor`/the log are in memory
-  only, so a restarted node loses all state (fine for a demo, not safe for
-  production use).
-- No snapshotting or cluster membership changes.
+- No InstallSnapshot RPC: a follower that falls behind past a leader's
+  snapshot boundary can't currently be caught up automatically.
+- No cluster membership changes.
 - RPC has no authentication/encryption — intended for local/trusted
   networks only.
