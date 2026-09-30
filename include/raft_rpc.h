@@ -13,14 +13,17 @@
 #include <optional>
 #include <functional>
 #include <thread>
+#include <vector>
 
 namespace raft {
 
 enum class MessageType : uint8_t {
     RequestVoteRequest = 1,
     RequestVoteResponse = 2,
-    AppendEntriesRequest = 3,   // used only as a heartbeat (no log entries)
+    AppendEntriesRequest = 3,   // heartbeat when entries is empty
     AppendEntriesResponse = 4,
+    ClientRequest = 5,
+    ClientResponse = 6,
 };
 
 struct RequestVoteRequest {
@@ -33,14 +36,40 @@ struct RequestVoteResponse {
     bool voteGranted;
 };
 
+// One entry in the replicated log.
+struct LogEntry {
+    uint32_t term;
+    std::string command;
+};
+
 struct AppendEntriesRequest {
     uint32_t term;
     uint32_t leaderId;
+    uint32_t prevLogIndex;   // index of the log entry right before `entries`
+    uint32_t prevLogTerm;    // term of that entry (0 if prevLogIndex == 0)
+    uint32_t leaderCommit;   // leader's commitIndex
+    std::vector<LogEntry> entries;  // empty for a pure heartbeat
 };
 
 struct AppendEntriesResponse {
     uint32_t term;
     bool success;
+    // Index of the last log entry the follower now has that matches the
+    // leader's log, if success. Lets the leader update matchIndex/nextIndex
+    // without guessing.
+    uint32_t matchIndex;
+};
+
+// A client submits a command to be replicated. Only the leader can accept
+// it; other nodes reject with a hint pointing at the current leader (if
+// known) so the client can retry there.
+struct ClientRequestMsg {
+    std::string command;
+};
+
+struct ClientResponseMsg {
+    bool success;
+    uint32_t leaderId;  // 0 if unknown; meaningful when success == false
 };
 
 // Starts a background TCP server listening on `port` that accepts single
@@ -52,9 +81,12 @@ public:
         std::function<RequestVoteResponse(const RequestVoteRequest&)>;
     using AppendEntriesHandler =
         std::function<AppendEntriesResponse(const AppendEntriesRequest&)>;
+    using ClientRequestHandler =
+        std::function<ClientResponseMsg(const ClientRequestMsg&)>;
 
     RpcServer(int port, RequestVoteHandler onRequestVote,
-              AppendEntriesHandler onAppendEntries);
+              AppendEntriesHandler onAppendEntries,
+              ClientRequestHandler onClientRequest = nullptr);
     ~RpcServer();
 
     void start();
@@ -65,6 +97,7 @@ private:
     int listenFd_ = -1;
     RequestVoteHandler onRequestVote_;
     AppendEntriesHandler onAppendEntries_;
+    ClientRequestHandler onClientRequest_;
     std::thread acceptThread_;
     bool running_ = false;
 
@@ -80,6 +113,10 @@ std::optional<RequestVoteResponse> sendRequestVote(
 
 std::optional<AppendEntriesResponse> sendAppendEntries(
     const std::string& host, int port, const AppendEntriesRequest& req,
+    int timeoutMs);
+
+std::optional<ClientResponseMsg> sendClientRequest(
+    const std::string& host, int port, const ClientRequestMsg& req,
     int timeoutMs);
 
 }  // namespace raft
