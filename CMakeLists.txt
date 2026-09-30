@@ -13,6 +13,7 @@ find_package(Threads REQUIRED)
 add_library(raft_core STATIC
     src/raft_rpc.cpp
     src/raft_node.cpp
+    src/raft_storage.cpp
 )
 target_include_directories(raft_core PUBLIC include)
 target_link_libraries(raft_core PUBLIC Threads::Threads)
@@ -36,3 +37,4 @@ endfunction()
 add_raft_test(test_rpc)
 add_raft_test(test_raft_node)
 add_raft_test(test_election)
+add_raft_test(test_persistence)
