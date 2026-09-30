@@ -1,6 +1,7 @@
 # Build output
 build/
 logs/
+data/
 
 # CMake
 CMakeCache.txt

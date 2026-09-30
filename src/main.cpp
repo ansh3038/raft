@@ -62,12 +62,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    std::string dataDir = "data/node" + std::to_string(myId);
     raft::RaftNode node(myId, myPort, std::move(peers),
                          [](uint32_t index, const std::string& command) {
                              std::cout << "[applied] index=" << index
                                        << " command=\"" << command << "\""
                                        << std::endl;
-                         });
+                         },
+                         dataDir, /*snapshotThreshold=*/1000);
     node.run();
     return 0;
 }
