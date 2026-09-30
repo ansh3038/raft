@@ -18,7 +18,7 @@ constexpr int kRpcTimeoutMs = 300;
 
 RaftNode::RaftNode(uint32_t id, int port, std::vector<PeerInfo> peers)
     : id_(id), port_(port), peers_(std::move(peers)) {
-    lastHeartbeat_ = std::chrono::steady_clock::now();
+    resetElectionDeadline();
     server_ = std::make_unique<RpcServer>(
         port_,
         [this](const RequestVoteRequest& r) { return handleRequestVote(r); },
@@ -42,6 +42,13 @@ int RaftNode::randomElectionTimeoutMs() const {
     std::uniform_int_distribution<int> dist(kElectionTimeoutMinMs,
                                              kElectionTimeoutMaxMs);
     return dist(rng);
+}
+
+// Resets the "haven't heard from a leader" clock and draws a fresh random
+// timeout for the new waiting period. Caller must hold mu_.
+void RaftNode::resetElectionDeadline() {
+    lastHeartbeat_ = std::chrono::steady_clock::now();
+    electionTimeoutMs_ = randomElectionTimeoutMs();
 }
 
 void RaftNode::start() {
@@ -74,7 +81,7 @@ RequestVoteResponse RaftNode::handleRequestVote(const RequestVoteRequest& req) {
         (!votedFor_.has_value() || votedFor_ == req.candidateId)) {
         grant = true;
         votedFor_ = req.candidateId;
-        lastHeartbeat_ = std::chrono::steady_clock::now();
+        resetElectionDeadline();
         log("voted for " + std::to_string(req.candidateId) + " in term " +
             std::to_string(req.term));
     }
@@ -90,7 +97,7 @@ AppendEntriesResponse RaftNode::handleAppendEntries(
     if (req.term >= currentTerm_) {
         becomeFollower(req.term);
     }
-    lastHeartbeat_ = std::chrono::steady_clock::now();
+    resetElectionDeadline();
     return AppendEntriesResponse{currentTerm_, true};
 }
 
@@ -105,7 +112,6 @@ void RaftNode::becomeFollower(uint32_t newTerm) {
 
 void RaftNode::electionTimerLoop() {
     while (!stopping_) {
-        int timeoutMs = randomElectionTimeoutMs();
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         if (stopping_) return;
 
@@ -113,7 +119,7 @@ void RaftNode::electionTimerLoop() {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - lastHeartbeat_)
                            .count();
-        bool shouldElect = role_ != Role::Leader && elapsed >= timeoutMs;
+        bool shouldElect = role_ != Role::Leader && elapsed >= electionTimeoutMs_;
         lock.unlock();
 
         if (shouldElect) startElection();
@@ -127,7 +133,7 @@ void RaftNode::startElection() {
         currentTerm_++;
         role_ = Role::Candidate;
         votedFor_ = id_;
-        lastHeartbeat_ = std::chrono::steady_clock::now();
+        resetElectionDeadline();
         term = currentTerm_;
         log("starting election for term " + std::to_string(term));
     }

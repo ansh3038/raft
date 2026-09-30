@@ -57,6 +57,12 @@ private:
     std::optional<uint32_t> votedFor_;
     Role role_ = Role::Follower;
     std::chrono::steady_clock::time_point lastHeartbeat_;
+    // The random election timeout for the *current* waiting period. Drawn
+    // once whenever lastHeartbeat_ is reset (construction, vote granted,
+    // heartbeat received, election started) rather than on every poll
+    // tick, so each follower gets one genuine random draw per round as
+    // the Raft paper intends.
+    int electionTimeoutMs_ = 0;
 
     std::unique_ptr<RpcServer> server_;
     std::thread electionThread_;
@@ -70,6 +76,7 @@ private:
     void leaderHeartbeatLoop();
 
     int randomElectionTimeoutMs() const;
+    void resetElectionDeadline();  // caller must hold mu_
     void log(const std::string& msg) const;
 };
 
