@@ -10,6 +10,7 @@
 #include "test_util.h"
 
 using namespace std::chrono_literals;
+using raft::ClientRequestMsg;
 using raft::PeerInfo;
 using raft::RaftNode;
 using raft::Role;
@@ -61,6 +62,32 @@ int main() {
         }
     }
     CHECK(followers == 2);
+
+    // Log replication: submit a couple of client commands directly to the
+    // leader and verify they get replicated and applied (commitIndex
+    // advances) consistently on every node.
+    RaftNode* leader = nullptr;
+    for (auto& n : nodes) {
+        if (n->role() == Role::Leader) leader = n.get();
+    }
+    CHECK(leader != nullptr);
+    if (leader != nullptr) {
+        auto r1 = leader->handleClientRequest(ClientRequestMsg{"cmd-1"});
+        CHECK(r1.success);
+        auto r2 = leader->handleClientRequest(ClientRequestMsg{"cmd-2"});
+        CHECK(r2.success);
+
+        // Heartbeats fire every 500ms; give replication a couple of rounds.
+        std::this_thread::sleep_for(2s);
+
+        for (auto& n : nodes) {
+            CHECK(n->commitIndex() == 2);
+            auto log = n->logCopy();
+            CHECK(log.size() == 2);
+            CHECK(log[0].command == "cmd-1");
+            CHECK(log[1].command == "cmd-2");
+        }
+    }
 
     nodes.clear();  // destructors stop servers/threads cleanly
     TEST_MAIN_RETURN();
